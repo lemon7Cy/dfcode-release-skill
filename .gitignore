@@ -1,0 +1,16 @@
+.DS_Store
+node_modules/
+.work*/
+.test-output*/
+release.config.json
+*.local.json
+*.log
+*.p8
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.dmg
+*.zip
+*.exe

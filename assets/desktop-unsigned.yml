@@ -1,0 +1,395 @@
+name: DFCode unsigned release
+
+run-name: @@RUN_NAME@@
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft_release_tag:
+        description: Existing private build-repository draft tag (not studio-v*)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dfcode-unsigned-${{ github.repository }}-${{ inputs.draft_release_tag }}
+  cancel-in-progress: false
+
+env:
+  DFCODE_INSTALLER_VERSION: @@VERSION@@
+  DFCODE_STUDIO_REPOSITORY: @@STUDIO_REPOSITORY@@
+  DFCODE_STUDIO_COMMIT: @@STUDIO_COMMIT@@
+  DFCODE_ENGINE_REPOSITORY: @@ENGINE_REPOSITORY@@
+  DFCODE_ENGINE_COMMIT: @@ENGINE_COMMIT@@
+  DFCODE_ENGINE_VERSION: @@ENGINE_VERSION@@
+  DFCODE_BUILD_REPOSITORY: @@BUILD_REPOSITORY@@
+  DFCODE_FULL_OTA_BASE_URL: @@UPDATE_BASE_URL@@
+  DFCODE_FULL_OTA_CHANNEL: @@CHANNEL@@
+  DFCODE_RELEASE_NOTES: @@RELEASE_NOTES@@
+  DFCODE_OTA_NOTES: @@OTA_NOTES@@
+  DFCODE_REQUIRE_CODE_SIGNING: "0"
+  DFCODE_WINDOWS_SIGNING_MODE: none
+  DFCODE_REQUIRE_FULL_OTA: "1"
+  CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify build repository and existing draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_TAG: ${{ inputs.draft_release_tag }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "$DFCODE_BUILD_REPOSITORY"
+          if [[ -z "$DRAFT_TAG" || "$DRAFT_TAG" == studio-v* || "$DRAFT_TAG" == -* ]]; then
+            echo "a non-release draft tag is required" >&2
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$DRAFT_TAG"
+          gh release view "$DRAFT_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq 'select(.isDraft == true) | .isDraft' | grep -Fx true
+
+  build-macos:
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout pinned Studio source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.DFCODE_STUDIO_REPOSITORY }}
+          ref: ${{ env.DFCODE_STUDIO_COMMIT }}
+          token: ${{ secrets.DFCODE_ENGINE_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Checkout workflow release notes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: .release-handoff
+          sparse-checkout: docs/releases
+          persist-credentials: false
+
+      - name: Checkout pinned Engine source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.DFCODE_ENGINE_REPOSITORY }}
+          ref: ${{ env.DFCODE_ENGINE_COMMIT }}
+          path: dfcode-engine
+          token: ${{ secrets.DFCODE_ENGINE_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+
+      - name: Verify source pins and apply build configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test "$(git rev-parse HEAD)" = "$DFCODE_STUDIO_COMMIT"
+          test "$(git -C dfcode-engine rev-parse HEAD)" = "$DFCODE_ENGINE_COMMIT"
+          test -s "$DFCODE_RELEASE_NOTES"
+          test -s "$DFCODE_OTA_NOTES"
+          node scripts/engine-contract.mjs set-source scripts/engine-lock.json "https://github.com/$DFCODE_ENGINE_REPOSITORY.git" "$DFCODE_ENGINE_COMMIT"
+          export STUDIO_ENGINE_SOURCE_PATH="$RUNNER_TEMP/dfcode-pinned-engine-source.json"
+          node --input-type=module <<'NODE'
+          import fs from "node:fs"
+          fs.writeFileSync(process.env.STUDIO_ENGINE_SOURCE_PATH, JSON.stringify({
+            repository: `https://github.com/${process.env.DFCODE_ENGINE_REPOSITORY}.git`,
+            ref: process.env.DFCODE_ENGINE_COMMIT,
+          }) + "\n")
+          NODE
+          printf 'STUDIO_ENGINE_SOURCE_PATH=%s\n' "$STUDIO_ENGINE_SOURCE_PATH" >> "$GITHUB_ENV"
+          printf 'STUDIO_ENGINE_WORKTREE=%s/dfcode-engine\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+
+      - name: Install Studio dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Engine dependencies
+        working-directory: dfcode-engine
+        run: bun install --frozen-lockfile
+
+      - name: Build pinned Engine and unsigned installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/set-desktop-version.mjs "$DFCODE_INSTALLER_VERSION"
+          bash scripts/build-engine-binary.sh
+          bun run --cwd packages/desktop dist
+
+      - name: Verify complete ad-hoc signature and stage macOS assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="release/DFCode-$DFCODE_INSTALLER_VERSION-arm64.dmg"
+          archive="release/DFCode-$DFCODE_INSTALLER_VERSION-arm64.zip"
+          feed="release/$DFCODE_FULL_OTA_CHANNEL-mac.yml"
+          for file in "$dmg" "$archive" "$archive.blockmap" "$feed"; do test -s "$file"; done
+          hdiutil verify "$dmg"
+          mount_point="$RUNNER_TEMP/dfcode-dmg-verification"
+          mkdir "$mount_point"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "$dmg" >/dev/null
+          trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true' EXIT
+          app="$mount_point/DFCode.app"
+          test -s "$app/Contents/_CodeSignature/CodeResources"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist")" = "$DFCODE_INSTALLER_VERSION"
+          test "$(lipo -archs "$app/Contents/MacOS/DFCode")" = arm64
+          test -L "$mount_point/Applications"
+          test "$(readlink "$mount_point/Applications")" = /Applications
+          actual_engine_version="$("$app/Contents/Resources/engine/dfcode" --version)"
+          test "$actual_engine_version" = "$DFCODE_ENGINE_VERSION"
+          printf 'DFCODE_ACTUAL_ENGINE_VERSION=%s\n' "$actual_engine_version" >> "$GITHUB_ENV"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=4 "$app" 2>&1 | grep -Fx 'Signature=adhoc'
+          mkdir -p release/installers
+          cp "$dmg" "$archive" "$archive.blockmap" "$feed" release/installers/
+
+      - name: Package unsigned macOS Full OTA
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/dfcode-full-ota-mac"
+          node scripts/prepare-admin-full-ota-release.mjs \
+            --artifact-dir release/installers --output-dir "$staging" \
+            --version "$DFCODE_INSTALLER_VERSION" --channel "$DFCODE_FULL_OTA_CHANNEL" \
+            --platform darwin --arch arm64 --studio-commit "$DFCODE_STUDIO_COMMIT" \
+            --engine-commit "$DFCODE_ENGINE_COMMIT" --engine-repository "https://github.com/$DFCODE_ENGINE_REPOSITORY.git" \
+            --signing-status unsigned --notarized false --release-notes "$DFCODE_OTA_NOTES"
+          cp "$staging/release.json" release/installers/FULL-OTA-RELEASE-darwin-arm64.json
+          cp "$staging/$DFCODE_FULL_OTA_CHANNEL-mac.yml" "release/installers/$DFCODE_FULL_OTA_CHANNEL-mac.yml"
+          archive="$GITHUB_WORKSPACE/release/installers/DFCode-$DFCODE_INSTALLER_VERSION-darwin-arm64-full-ota-unsigned.zip"
+          (cd "$staging" && zip -q -0 "$archive" ./*)
+          unzip -tq "$archive"
+
+      - name: Record macOS provenance and upload to existing draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_TAG: ${{ inputs.draft_release_tag }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from "node:fs"
+          import { execFileSync } from "node:child_process"
+          import { createRequire } from "node:module"
+          const env = process.env
+          const require = createRequire(`${process.cwd()}/packages/desktop/package.json`)
+          const info = {
+            schemaVersion: 1, version: env.DFCODE_INSTALLER_VERSION, platform: "darwin", arch: "arm64", signingStatus: "unsigned", notarized: false,
+            studioRepository: env.DFCODE_STUDIO_REPOSITORY, studioCommit: env.DFCODE_STUDIO_COMMIT,
+            engineRepository: env.DFCODE_ENGINE_REPOSITORY, engineCommit: env.DFCODE_ENGINE_COMMIT, engineVersion: env.DFCODE_ACTUAL_ENGINE_VERSION,
+            workflowRepository: env.GITHUB_REPOSITORY, workflowCommit: env.GITHUB_SHA,
+            runId: env.GITHUB_RUN_ID, runAttempt: env.GITHUB_RUN_ATTEMPT,
+            runUrl: `${env.GITHUB_SERVER_URL}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`,
+            updateBaseUrl: env.DFCODE_FULL_OTA_BASE_URL, updateChannel: env.DFCODE_FULL_OTA_CHANNEL,
+            tools: { node: process.version, bun: execFileSync("bun", ["--version"], {encoding: "utf8"}).trim(), electron: require("electron/package.json").version, electronBuilder: require("electron-builder/package.json").version },
+          }
+          fs.writeFileSync("release/installers/BUILD-INFO-darwin-arm64.json", JSON.stringify(info, null, 2) + "\n")
+          NODE
+          (cd release/installers && shasum -a 256 ./* > SHA256SUMS-darwin-arm64.txt)
+          gh release view "$DRAFT_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq 'select(.isDraft == true) | .isDraft' | grep -Fx true
+          gh release upload "$DRAFT_TAG" release/installers/* --repo "$GITHUB_REPOSITORY"
+
+  build-windows:
+    needs: prepare
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout pinned Studio source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.DFCODE_STUDIO_REPOSITORY }}
+          ref: ${{ env.DFCODE_STUDIO_COMMIT }}
+          token: ${{ secrets.DFCODE_ENGINE_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Checkout workflow release notes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: .release-handoff
+          sparse-checkout: docs/releases
+          persist-credentials: false
+
+      - name: Checkout pinned Engine source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.DFCODE_ENGINE_REPOSITORY }}
+          ref: ${{ env.DFCODE_ENGINE_COMMIT }}
+          path: dfcode-engine
+          token: ${{ secrets.DFCODE_ENGINE_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+
+      - name: Verify source pins and apply build configuration
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not [Environment]::Is64BitOperatingSystem) { throw "Windows x64 runner required" }
+          if ((git rev-parse HEAD) -ne $env:DFCODE_STUDIO_COMMIT) { throw "Studio source mismatch" }
+          if ((git -C dfcode-engine rev-parse HEAD) -ne $env:DFCODE_ENGINE_COMMIT) { throw "Engine source mismatch" }
+          foreach ($notes in @($env:DFCODE_RELEASE_NOTES, $env:DFCODE_OTA_NOTES)) {
+            if (-not (Test-Path $notes -PathType Leaf)) { throw "release notes missing" }
+          }
+          node scripts/engine-contract.mjs set-source scripts/engine-lock.json "https://github.com/$env:DFCODE_ENGINE_REPOSITORY.git" $env:DFCODE_ENGINE_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw "Engine source pinning failed" }
+          "STUDIO_ENGINE_WIN_X64_WORKTREE=$env:GITHUB_WORKSPACE\dfcode-engine" >> $env:GITHUB_ENV
+
+      - name: Install Studio dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Engine dependencies
+        working-directory: dfcode-engine
+        run: bun install --frozen-lockfile
+
+      - name: Build pinned Windows Engine
+        working-directory: dfcode-engine/packages/dfcode
+        run: bun run script/build.ts --single --skip-install
+
+      - name: Build unsigned Windows installer
+        run: |
+          node scripts/set-desktop-version.mjs $env:DFCODE_INSTALLER_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "version stamping failed" }
+          node scripts/pack-desktop-win.mjs
+
+      - name: Verify PE inventory and stage Windows assets
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Get-Item "release\win32-x64\DFCode-$env:DFCODE_INSTALLER_VERSION-x64.exe"
+          if (-not $installer.VersionInfo.ProductVersion.StartsWith($env:DFCODE_INSTALLER_VERSION)) { throw "installer version mismatch" }
+          $engine = "release\win32-x64\win-unpacked\resources\engine\dfcode.exe"
+          $actualEngineVersion = (& $engine --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualEngineVersion -ne $env:DFCODE_ENGINE_VERSION) { throw "packaged Engine version mismatch" }
+          "DFCODE_ACTUAL_ENGINE_VERSION=$actualEngineVersion" >> $env:GITHUB_ENV
+          $engineManifest = Get-Content "release\win32-x64\win-unpacked\resources\engine\manifest.json" -Raw | ConvertFrom-Json
+          if ($engineManifest.commit -ne $env:DFCODE_ENGINE_COMMIT -or $engineManifest.engineVersion -ne $actualEngineVersion) { throw "Engine manifest mismatch" }
+          $inventory = @(Get-Content "release\win32-x64\PE-INVENTORY.json" -Raw | ConvertFrom-Json)
+          if ($inventory.Count -lt 2) { throw "PE inventory missing" }
+          $results = @()
+          foreach ($entry in $inventory) {
+            if ($entry.signingMode -ne "none" -or $entry.signed) { throw "unexpected production signing in CI" }
+            $file = Get-Item "release\win32-x64\$($entry.path)"
+            if ($file.Length -ne $entry.size -or (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.sha256) { throw "PE inventory mismatch" }
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            $results += @{ path = $entry.path; status = [string]$signature.Status; signerSubject = $signature.SignerCertificate.Subject; signerThumbprint = $signature.SignerCertificate.Thumbprint }
+          }
+          @{ schemaVersion = 1; signingMode = "none"; signingRequired = $false; files = $results } | ConvertTo-Json -Depth 6 | Set-Content "release\win32-x64\WINDOWS-SIGNING-REPORT.json" -Encoding utf8
+          New-Item -ItemType Directory "release\installers" | Out-Null
+          foreach ($name in @($installer.Name, "$($installer.Name).blockmap", "$env:DFCODE_FULL_OTA_CHANNEL.yml", "PE-INVENTORY.json", "WINDOWS-SIGNING-REPORT.json")) {
+            $source = Get-Item "release\win32-x64\$name"
+            if ($source.Length -eq 0) { throw "empty Windows asset: $name" }
+            Copy-Item $source.FullName "release\installers\$name"
+          }
+
+      - name: Package unsigned Windows Full OTA
+        run: |
+          $ErrorActionPreference = "Stop"
+          $staging = Join-Path $env:RUNNER_TEMP "dfcode-full-ota-win"
+          node scripts/prepare-admin-full-ota-release.mjs `
+            --artifact-dir release/installers --output-dir $staging `
+            --version $env:DFCODE_INSTALLER_VERSION --channel $env:DFCODE_FULL_OTA_CHANNEL `
+            --platform win32 --arch x64 --studio-commit $env:DFCODE_STUDIO_COMMIT `
+            --engine-commit $env:DFCODE_ENGINE_COMMIT --engine-repository "https://github.com/$env:DFCODE_ENGINE_REPOSITORY.git" `
+            --signing-status unsigned --release-notes $env:DFCODE_OTA_NOTES
+          if ($LASTEXITCODE -ne 0) { throw "Full OTA staging failed" }
+          Copy-Item "$staging\release.json" "release\installers\FULL-OTA-RELEASE-win32-x64.json"
+          Copy-Item "$staging\$env:DFCODE_FULL_OTA_CHANNEL.yml" "release\installers\$env:DFCODE_FULL_OTA_CHANNEL.yml"
+          $archive = "$env:GITHUB_WORKSPACE\release\installers\DFCode-$env:DFCODE_INSTALLER_VERSION-win32-x64-full-ota-unsigned.zip"
+          & 7z a -tzip -mx=0 $archive "$staging\*"
+          if ($LASTEXITCODE -ne 0) { throw "Full OTA ZIP creation failed" }
+          & 7z t $archive
+          if ($LASTEXITCODE -ne 0) { throw "Full OTA ZIP verification failed" }
+
+      - name: Prepare complete Windows signing handoff
+        run: |
+          $ErrorActionPreference = "Stop"
+          $handoff = Join-Path $env:RUNNER_TEMP "dfcode-windows-signing-handoff"
+          New-Item -ItemType Directory $handoff | Out-Null
+          Copy-Item "release\win32-x64\win-unpacked" (Join-Path $handoff "win-unpacked") -Recurse
+          $unsignedInstallers = Join-Path $handoff "unsigned-installers"
+          New-Item -ItemType Directory $unsignedInstallers | Out-Null
+          Get-ChildItem "release\installers" -File | Where-Object { $_.Name -notlike "*-full-ota-unsigned.zip" } | Copy-Item -Destination $unsignedInstallers
+          Copy-Item "release\win32-x64\PE-INVENTORY.json" $handoff
+          Copy-Item "release\win32-x64\WINDOWS-SIGNING-REPORT.json" $handoff
+          Copy-Item $env:DFCODE_RELEASE_NOTES $handoff
+          Copy-Item $env:DFCODE_OTA_NOTES $handoff
+          $sourceZip = Join-Path $handoff "studio-source-$env:DFCODE_STUDIO_COMMIT.zip"
+          $sourcePaths = @("package.json", "bun.lock", "tsconfig.base.json", "assets", "scripts", "packages/core", "packages/desktop", "packages/app/src", "packages/app/public", "packages/app/package.json", "packages/app/tsconfig.json", "packages/app/vite.config.ts", "packages/app/index.html")
+          git archive --format=zip --output=$sourceZip $env:DFCODE_STUDIO_COMMIT -- @sourcePaths
+          if ($LASTEXITCODE -ne 0) { throw "source archive failed" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $sourceArchive = [IO.Compression.ZipFile]::OpenRead($sourceZip)
+          try {
+            foreach ($entry in $sourceArchive.Entries) {
+              if ($entry.FullName -match '(^|/)(\.env(?:\.[^/]*)?|node_modules|\.git)(/|$)' -or $entry.FullName -match '\.(p8|p12|pfx|pem|key)$') { throw "private or generated input found in source archive" }
+            }
+          } finally { $sourceArchive.Dispose() }
+          $config = Join-Path $handoff "packaging-config"
+          New-Item -ItemType Directory $config | Out-Null
+          Copy-Item "packages\desktop\package.json" (Join-Path $config "desktop-package.json")
+          Copy-Item "scripts\engine-lock.json" $config
+          Copy-Item "packages\desktop\windows-signing-hook.mjs" $config
+          Copy-Item "packages\desktop\build" (Join-Path $config "build") -Recurse
+          if (Test-Path "release\win32-x64\builder-effective-config.yaml") { Copy-Item "release\win32-x64\builder-effective-config.yaml" $config }
+          $tools = @{
+            node = (node --version | Out-String).Trim(); bun = (bun --version | Out-String).Trim()
+            electron = (node -p "require('./packages/desktop/node_modules/electron/package.json').version" | Out-String).Trim()
+            electronBuilder = (node -p "require('./packages/desktop/node_modules/electron-builder/package.json').version" | Out-String).Trim()
+            powerShell = $PSVersionTable.PSVersion.ToString(); runnerImage = $env:ImageOS; runnerImageVersion = $env:ImageVersion
+          }
+          $info = @{
+            schemaVersion = 1; version = $env:DFCODE_INSTALLER_VERSION; platform = "win32"; arch = "x64"; signingStatus = "unsigned"
+            studioRepository = $env:DFCODE_STUDIO_REPOSITORY; studioCommit = $env:DFCODE_STUDIO_COMMIT
+            engineRepository = $env:DFCODE_ENGINE_REPOSITORY; engineCommit = $env:DFCODE_ENGINE_COMMIT; engineVersion = $env:DFCODE_ACTUAL_ENGINE_VERSION
+            workflowRepository = $env:GITHUB_REPOSITORY; workflowCommit = $env:GITHUB_SHA
+            runId = $env:GITHUB_RUN_ID; runAttempt = $env:GITHUB_RUN_ATTEMPT
+            runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            updateBaseUrl = $env:DFCODE_FULL_OTA_BASE_URL; updateChannel = $env:DFCODE_FULL_OTA_CHANNEL; tools = $tools
+          }
+          $info | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $handoff "BUILD-INFO.json") -Encoding utf8
+          Copy-Item (Join-Path $handoff "BUILD-INFO.json") "release\installers\BUILD-INFO-win32-x64.json"
+          $checksums = @(Get-ChildItem $handoff -File -Recurse -Force | Sort-Object FullName | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($handoff, $_.FullName).Replace('\', '/')
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $relative"
+          })
+          $checksums | Set-Content (Join-Path $handoff "SHA256SUMS.txt") -Encoding utf8
+          $archive = "$env:GITHUB_WORKSPACE\release\installers\DFCode-$env:DFCODE_INSTALLER_VERSION-win32-x64-signing-input-unsigned.zip"
+          & 7z a -tzip -mx=1 $archive "$handoff\*"
+          if ($LASTEXITCODE -ne 0) { throw "signing handoff creation failed" }
+          & 7z t $archive
+          if ($LASTEXITCODE -ne 0) { throw "signing handoff verification failed" }
+          "$((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($archive))" | Set-Content "$archive.sha256" -Encoding utf8
+
+      - name: Record Windows checksums and upload to existing draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_TAG: ${{ inputs.draft_release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $checksums = @(Get-ChildItem "release\installers" -File | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          })
+          $checksums | Set-Content "release\installers\SHA256SUMS-win32-x64.txt" -Encoding utf8
+          $draft = gh release view $env:DRAFT_TAG --repo $env:GITHUB_REPOSITORY --json isDraft --jq '.isDraft'
+          if ($LASTEXITCODE -ne 0 -or $draft -ne "true") { throw "existing release must remain draft" }
+          gh release upload $env:DRAFT_TAG release\installers\* --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw "Windows draft upload failed" }

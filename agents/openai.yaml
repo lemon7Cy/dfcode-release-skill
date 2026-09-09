@@ -1,0 +1,4 @@
+interface:
+  display_name: "DFCode 构建与本机签名"
+  short_description: "固定源码提交，在 GitHub 构建未签名包并完成 Mac 本地签名公证交付"
+  default_prompt: "使用 $dfcode-release，按我给出的 Studio 和 Engine commit 构建并交付对应平台的签名 Full OTA ZIP。"

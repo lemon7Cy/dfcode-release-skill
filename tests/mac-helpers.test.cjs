@@ -9,6 +9,7 @@ const U = require("../scripts/mac-utils.cjs")
 const S = require("../scripts/sign-macos.cjs")
 const F = require("../scripts/finalize-macos.cjs")
 const M = require("../scripts/mac-release.cjs")
+const { symlinkOrSkip } = require("./platform-support.cjs")
 
 function directory(t) { const result = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "mac-helper-test-"))); t.after(() => fs.rmSync(result, { recursive: true, force: true })); return result }
 
@@ -43,19 +44,26 @@ test("Gatekeeper disabled or override does not become full verification", () => 
 
 test("tree digest does not follow framework symlink loops and rejects escaping links", (t) => {
   const root = directory(t), source = path.join(root, "source"), copy = path.join(root, "copy")
-  fs.mkdirSync(source); fs.writeFileSync(path.join(source, "file"), "body"); fs.symlinkSync(".", path.join(source, "Current"))
+  fs.mkdirSync(source); fs.writeFileSync(path.join(source, "file"), "body")
+  if (!symlinkOrSkip(t, ".", path.join(source, "Current"), "dir")) return
   fs.cpSync(source, copy, { recursive: true, verbatimSymlinks: true })
   assert.deepEqual(U.treeDigest(source), U.treeDigest(copy))
   fs.symlinkSync("../", path.join(source, "escape"))
   assert.throws(() => U.treeDigest(source), /escapes application/)
 })
 
-test("output protection refuses nonempty directories and symlink ancestors", (t) => {
-  const root = directory(t), nonempty = path.join(root, "nonempty"), linked = path.join(root, "linked")
-  fs.mkdirSync(nonempty); fs.writeFileSync(path.join(nonempty, "preserve"), "user bytes"); fs.symlinkSync(nonempty, linked)
+test("output protection refuses nonempty directories without altering their files", (t) => {
+  const root = directory(t), nonempty = path.join(root, "nonempty")
+  fs.mkdirSync(nonempty); fs.writeFileSync(path.join(nonempty, "preserve"), "user bytes")
   assert.throws(() => U.ensureEmpty(nonempty), /non-empty/)
-  assert.throws(() => U.ensureEmpty(path.join(linked, "new"), true), /Symlink/)
   assert.equal(fs.readFileSync(path.join(nonempty, "preserve"), "utf8"), "user bytes")
+})
+
+test("output protection refuses symlink ancestors", (t) => {
+  const root = directory(t), target = path.join(root, "target"), linked = path.join(root, "linked")
+  fs.mkdirSync(target)
+  if (!symlinkOrSkip(t, target, linked, "dir")) return
+  assert.throws(() => U.ensureEmpty(path.join(linked, "new"), true), /Symlink/)
 })
 
 test("trash is restricted to owned work; unregister happens before trash", (t) => {

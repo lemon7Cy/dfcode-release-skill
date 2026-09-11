@@ -1,8 +1,8 @@
 {
   "name": "dfcode-release-skill",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Commit-pinned DFCode CI handoff and local macOS signing skill",
+  "description": "Commit-pinned DFCode CI handoff and local macOS/Windows signing skill",
   "scripts": { "test": "node scripts/test.cjs" },
   "engines": { "node": ">=22" }
 }

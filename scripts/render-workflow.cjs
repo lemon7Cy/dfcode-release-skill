@@ -28,7 +28,7 @@ function renderWorkflow(rawConfig) {
     assert(typeof value === "string" && !value.includes("${{"), `Workflow expression is not allowed in ${name}`)
   }
   const used = new Set()
-  const result = fs.readFileSync(TEMPLATE, "utf8").replace(/@@([A-Z_]+)@@/g, (_, name) => {
+  const result = fs.readFileSync(TEMPLATE, "utf8").replaceAll("\r\n", "\n").replace(/@@([A-Z_]+)@@/g, (_, name) => {
     assert(Object.hasOwn(replacements, name), `Unknown workflow template field: ${name}`)
     used.add(name)
     return JSON.stringify(replacements[name])

@@ -40,3 +40,15 @@ test("wrong source repo, wrong file role and stale notes cannot pass", (t) => {
   fs.writeFileSync(f.config.otaNotesFile, "Other release summary")
   assert.throws(() => verifyFullOtaEntries(f.entries(), f.config, f.target, "unsigned", { load: JSON.parse }))
 })
+
+test("signed Windows manifests require the configured publisher rather than a signed flag alone", (t) => {
+  const f = fixture(t)
+  f.manifest.signing = { status: "signed", publisherName: "Trusted Publisher" }
+  assert.throws(() => verifyFullOtaEntries(f.entries(), f.config, f.target, "signed", { load: JSON.parse }), /configured publisher/)
+  f.config.windows = { publisherName: "Trusted Publisher" }
+  assert.equal(verifyFullOtaEntries(f.entries(), f.config, f.target, "signed", { load: JSON.parse }).signing.publisherName, "Trusted Publisher")
+  f.manifest.signing.publisherName = "Another Publisher"
+  assert.throws(() => verifyFullOtaEntries(f.entries(), f.config, f.target, "signed", { load: JSON.parse }), /publisher mismatch/)
+  f.manifest.signing = { status: "unsigned" }
+  assert.throws(() => verifyFullOtaEntries(f.entries(), f.config, f.target, "signed", { load: JSON.parse }))
+})

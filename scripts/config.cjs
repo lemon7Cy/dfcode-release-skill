@@ -9,7 +9,32 @@ const { createHash } = require("node:crypto")
 const SHA = /^[a-f0-9]{40}$/
 const REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
-const FIELDS = new Set(["schemaVersion", "attempt", "version", "studioRepository", "studioCommit", "engineRepository", "engineCommit", "engineVersion", "buildRepository", "channel", "updateBaseUrl", "workspace", "outputDir", "releaseNotesFile", "otaNotesFile", "mac"])
+const FIELDS = new Set(["schemaVersion", "attempt", "version", "studioRepository", "studioCommit", "engineRepository", "engineCommit", "engineVersion", "buildRepository", "channel", "updateBaseUrl", "workspace", "outputDir", "releaseNotesFile", "otaNotesFile", "mac", "windows"])
+const WINDOWS_FIELDS = new Set(["publisherName", "certificateSha1", "keypairAlias", "smctlPath", "signtoolPath", "powershellPath", "timestampUrl", "preserveMicrosoftSignatures"])
+
+function normalizeWindowsConfig(raw, base) {
+  assert(raw && typeof raw === "object" && !Array.isArray(raw), "windows config must be an object")
+  for (const key of Object.keys(raw)) assert(WINDOWS_FIELDS.has(key), `Unknown windows config key: ${key}; credentials do not belong in config`)
+  const result = { timestampUrl: "http://timestamp.digicert.com", preserveMicrosoftSignatures: true, ...raw }
+  for (const key of ["publisherName", "certificateSha1", "keypairAlias", "smctlPath", "signtoolPath", "powershellPath", "timestampUrl"]) {
+    if (result[key] === undefined) continue
+    assert(typeof result[key] === "string" && result[key].trim() && !/[\u0000-\u001f\u007f]/.test(result[key]), `Invalid windows.${key}`)
+    assert(result[key] === result[key].trim(), `windows.${key} must not contain surrounding whitespace`)
+  }
+  if (result.certificateSha1 !== undefined) {
+    assert(/^[a-fA-F0-9]{40}$/.test(result.certificateSha1), "windows.certificateSha1 must be a certificate SHA-1 fingerprint")
+    result.certificateSha1 = result.certificateSha1.toUpperCase()
+  }
+  if (result.publisherName !== undefined) assert(result.publisherName.length <= 512, "windows.publisherName is too long")
+  if (result.keypairAlias !== undefined) assert(result.keypairAlias.length <= 200, "windows.keypairAlias is too long")
+  const timestamp = new URL(result.timestampUrl)
+  assert(["http:", "https:"].includes(timestamp.protocol) && !timestamp.username && !timestamp.password && !timestamp.search && !timestamp.hash, "windows.timestampUrl must be a credential-free HTTP(S) URL")
+  assert(typeof result.preserveMicrosoftSignatures === "boolean", "windows.preserveMicrosoftSignatures must be boolean")
+  for (const key of ["smctlPath", "signtoolPath", "powershellPath"]) {
+    if (result[key] !== undefined) result[key] = path.resolve(base, result[key])
+  }
+  return result
+}
 
 function inside(root, target) {
   const relative = path.relative(root, target)
@@ -70,6 +95,7 @@ function normalizeConfig(raw, base = process.cwd()) {
   assert(/^[A-Z0-9]{10}$/.test(result.mac.teamId), "mac.teamId must be an Apple Team ID")
   assert(result.mac.identity === "" || /^[A-Fa-f0-9]{40}$/.test(result.mac.identity), "mac.identity must be empty or an identity SHA-1 fingerprint")
   assert(result.mac.notaryProfile && result.mac.notaryProfile.length <= 120, "mac.notaryProfile is required")
+  if (raw.windows !== undefined) result.windows = normalizeWindowsConfig(raw.windows, base)
   return result
 }
 
@@ -86,4 +112,4 @@ function fingerprint(config) {
   return createHash("sha256").update(JSON.stringify(config)).digest("hex")
 }
 
-module.exports = { loadConfig, normalizeConfig, releaseNames, fingerprint, inside, canonical, SHA, REPO, VERSION }
+module.exports = { loadConfig, normalizeConfig, normalizeWindowsConfig, releaseNames, fingerprint, inside, canonical, SHA, REPO, VERSION }

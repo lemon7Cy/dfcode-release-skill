@@ -236,6 +236,16 @@ function routeHost(platform = process.platform, arch = process.arch) {
   return null
 }
 
+function nativeSigningArguments(configFile, resume = false, platform = process.platform, arch = process.arch) {
+  const driver = routeHost(platform, arch)
+  assert(driver, "Native signing requires macOS arm64 or Windows x64")
+  const args = [path.join(__dirname, driver), "--config", path.resolve(configFile)]
+  if (driver === "windows-release.cjs") args.push("--sign")
+  args.push("--execute")
+  if (resume) args.push("--resume")
+  return args
+}
+
 function macPublicationInputs(config) {
   const reportFile = path.join(config.outputDir, "reports", "mac-final.json")
   assert(fs.existsSync(reportFile), "Mac signing has not produced its final report; sign first or explicitly publish --unsigned-only")
@@ -256,6 +266,45 @@ function macPublicationInputs(config) {
   return { report, files: names.map(([inputName, name]) => {
     const matches = report.files.filter((entry) => path.basename(entry.path) === inputName)
     assert.equal(matches.length, 1, `Missing native delivery: ${inputName}`)
+    return { ...matches[0], name }
+  }) }
+}
+
+function windowsPublicationInputs(config) {
+  const reportFile = path.join(config.outputDir, "reports", "windows-final.json")
+  assert(fs.existsSync(reportFile), "Windows signing has not produced its final report; sign first or explicitly publish --unsigned-only")
+  assert(config.windows?.publisherName && config.windows?.certificateSha1, "Windows publication requires its configured publisher and certificate")
+  const report = JSON.parse(fs.readFileSync(reportFile, "utf8"))
+  assert.equal(report.schemaVersion, 1)
+  assert.equal(report.status, "finalized")
+  assert.equal(report.version, config.version)
+  assert.equal(report.configBinding, require("./windows-release.cjs").configBinding(config), "Windows report is bound to different source/config/notes")
+  for (const key of ["studioCommit", "engineCommit", "engineVersion"]) assert.equal(report.source?.[key], config[key], `Windows report ${key} mismatch`)
+  assert.equal(report.build?.repository, config.buildRepository, "Windows report build repository mismatch")
+  assert.equal(report.signing?.status, "signed", "Windows report does not establish signing")
+  assert.equal(report.signing.publisherName, config.windows.publisherName, "Windows report publisher mismatch")
+  assert.equal(report.signing.certificateSha1?.toUpperCase(), config.windows.certificateSha1.toUpperCase(), "Windows report certificate mismatch")
+  assert(Array.isArray(report.files) && report.files.length >= 2, "Windows report has no complete delivery")
+  const root = canonical(path.join(config.outputDir, "delivery", "windows"))
+  const seen = new Set()
+  for (const file of report.files) {
+    assert(typeof file.path === "string" && path.isAbsolute(file.path), "Windows report requires absolute file paths")
+    const actual = canonical(file.path)
+    assert(inside(root, actual) && actual !== root, "Windows report references a file outside this release's native delivery")
+    const folded = actual.toLowerCase()
+    assert(!seen.has(folded), "Windows report contains duplicate files")
+    seen.add(folded)
+    assert(fs.statSync(file.path).isFile(), "Windows delivery entry is not a file")
+    assert.equal(fs.statSync(file.path).size, file.size)
+    assert.equal(hashFile(file.path), file.sha256, "Native Windows delivery changed after verification")
+  }
+  const names = [
+    [`DFCode-${config.version}-x64.exe`, `DFCode-${config.version}-x64-signed.exe`],
+    [`DFCode-${config.version}-win32-x64-full-ota-signed.zip`, `DFCode-${config.version}-win32-x64-full-ota-signed.zip`],
+  ]
+  return { report, files: names.map(([inputName, name]) => {
+    const matches = report.files.filter((entry) => path.basename(entry.path) === inputName)
+    assert.equal(matches.length, 1, `Missing native Windows delivery: ${inputName}`)
     return { ...matches[0], name }
   }) }
 }
@@ -282,8 +331,36 @@ async function publish(config, options) {
   for (const entry of targets) assert.equal(hashFile(path.join(directory, entry.name)), entry.sha256, "Unsigned delivery changed since CI verification")
   const signedZip = `DFCode-${config.version}-darwin-arm64-full-ota-signed-notarized.zip`
   const signedDmg = `DFCode-${config.version}-arm64-signed-notarized.dmg`
-  if (!options.flags.has("--unsigned-only")) {
-    assert.equal(routeHost(), "mac-release.cjs", "Windows native signing is not implemented yet; publish its handoff with --unsigned-only")
+  if (!options.flags.has("--unsigned-only") && routeHost() === "windows-release.cjs") {
+    const native = windowsPublicationInputs(config)
+    const zipName = `DFCode-${config.version}-win32-x64-full-ota-signed.zip`
+    const zip = native.files.find((entry) => entry.name === zipName)
+    const installer = native.files.find((entry) => entry.name === `DFCode-${config.version}-x64-signed.exe`)
+    const verified = verifyFullOtaEntries(await inspectFlatZip(zip.path, config.workspace), config, { platform: "win32", arch: "x64" }, "signed")
+    const insideExe = verified.files.find((entry) => entry.name === `DFCode-${config.version}-x64.exe`)
+    assert.equal(installer.sha256, insideExe.sha256, "Signed Windows installer differs from its Full OTA ZIP")
+    assert.equal(installer.size, insideExe.size)
+    for (const entry of native.files) {
+      const destination = path.join(directory, entry.name)
+      if (fs.existsSync(destination)) assert.equal(hashFile(destination), entry.sha256, "Existing delivery alias has other bytes")
+      else fs.copyFileSync(entry.path, destination, fs.constants.COPYFILE_EXCL)
+      targets.push({ name: entry.name })
+    }
+    const evidence = [
+      `# DFCode ${config.version} Windows Verification`, "",
+      `Studio: ${config.studioRepository}@${config.studioCommit}`,
+      `Engine: ${config.engineRepository}@${config.engineCommit} (${config.engineVersion})`,
+      `Publisher: ${native.report.signing.publisherName}`,
+      `Certificate SHA-1: ${native.report.signing.certificateSha1}`,
+      "Final signed installer and Full OTA files match the verified Windows report and each other.",
+      "Static signing and packaging verification does not establish runtime installation or actual OTA acceptance.",
+      `Recorded acceptance results: ${JSON.stringify(native.report.acceptance || {})}`,
+      "This publication command did not install the application, perform an OTA upgrade, or publish Admin.", "",
+    ].join("\n")
+    fs.writeFileSync(path.join(directory, "WINDOWS-VERIFICATION.md"), evidence)
+    targets.push({ name: "WINDOWS-VERIFICATION.md" })
+  } else if (!options.flags.has("--unsigned-only")) {
+    assert.equal(routeHost(), "mac-release.cjs", "Native publication requires macOS arm64 or Windows x64; use --unsigned-only for unsigned handoff")
     const native = macPublicationInputs(config)
     for (const entry of native.files) {
       const destination = path.join(directory, entry.name)
@@ -364,7 +441,7 @@ async function main(argv = process.argv.slice(2)) {
   const config = loadConfig(options.values["--config"])
   assert(["plan", "prepare", "dispatch", "wait", "status", "collect", "sign", "publish"].includes(options.command), "Unknown command")
   if (options.command === "plan" || (!options.flags.has("--execute") && !["wait", "status"].includes(options.command))) {
-    console.log(JSON.stringify({ command: options.command, mode: "plan-only", version: config.version, studio: `${config.studioRepository}@${config.studioCommit}`, engine: `${config.engineRepository}@${config.engineCommit}`, names: releaseNames(config), signingDriver: routeHost(), windowsSigningImplemented: false, workspace: config.workspace, outputDir: config.outputDir, adminPublish: false }, null, 2)); return
+    console.log(JSON.stringify({ command: options.command, mode: "plan-only", version: config.version, studio: `${config.studioRepository}@${config.studioCommit}`, engine: `${config.engineRepository}@${config.engineCommit}`, names: releaseNames(config), signingDriver: routeHost(), windowsSigningImplemented: true, workspace: config.workspace, outputDir: config.outputDir, adminPublish: false }, null, 2)); return
   }
   if (options.command === "prepare") return prepare(config)
   if (options.command === "dispatch") return dispatch(config)
@@ -376,14 +453,11 @@ async function main(argv = process.argv.slice(2)) {
   }
   if (options.command === "collect") return collect(config)
   if (options.command === "sign") {
-    const driver = routeHost()
-    assert(driver, "Only macOS arm64 signing is implemented; Windows x64 currently routes to a handoff, other hosts stop here")
-    const args = [path.join(__dirname, driver), "--config", path.resolve(options.values["--config"]), "--execute"]
-    if (options.flags.has("--resume") && process.platform === "darwin") args.push("--resume")
+    const args = nativeSigningArguments(options.values["--config"], options.flags.has("--resume"))
     run(process.execPath, args, { stdio: "inherit", timeout: 90 * 60_000 }); return
   }
   if (options.command === "publish") return publish(config, options)
 }
 
-module.exports = { parse, chooseVersion, routeHost, macPublicationInputs, assertExistingRelease, main }
+module.exports = { parse, chooseVersion, routeHost, nativeSigningArguments, macPublicationInputs, windowsPublicationInputs, assertExistingRelease, main }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })

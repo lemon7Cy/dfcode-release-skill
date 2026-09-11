@@ -7,6 +7,7 @@ const path = require("node:path")
 const { spawnSync } = require("node:child_process")
 const { test } = require("node:test")
 const { renderWorkflow, writeWorkflow } = require("../scripts/render-workflow.cjs")
+const { symlinkOrSkip, testBash } = require("./platform-support.cjs")
 
 function fixture(overrides = {}) {
   return {
@@ -79,7 +80,9 @@ test("has only draft input, no artifact storage or signing credentials, and pres
   assert.match(text, /SHA256SUMS-win32-x64\.txt/)
 })
 
-test("draft validation rejects empty, formal, invalid and missing tags before building", () => {
+test("draft validation rejects empty, formal, invalid and missing tags before building", (t) => {
+  const bash = testBash()
+  if (!bash) { t.skip("A working Bash is unavailable; Windows requires Git Bash for this shell-specific test"); return }
   const text = renderWorkflow(fixture())
   const body = text.slice(text.indexOf("      - name: Verify build repository and existing draft"), text.indexOf("\n  build-macos:"))
   const shell = body.slice(body.indexOf("        run: |\n") + 15).split("\n").map((line) => line.replace(/^          /, "")).join("\n")
@@ -96,7 +99,10 @@ test("draft validation rejects empty, formal, invalid and missing tags before bu
       ["internal-studio-v0.2.27", "yes", "example/studio", false, false],
     ]) {
       if (fs.existsSync(calls)) fs.unlinkSync(calls)
-      const result = spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, CALLS: calls, DRAFT_TAG: tag, DRAFT_EXISTS: exists, GITHUB_REPOSITORY: repository, DFCODE_BUILD_REPOSITORY: "builder/studio" } })
+      const prefix = process.platform === "win32"
+        ? 'export PATH="$(cygpath -u "$DFCODE_FIXTURE_BIN"):$PATH"\nexport CALLS="$(cygpath -u "$CALLS")"\n'
+        : 'export PATH="$DFCODE_FIXTURE_BIN:$PATH"\n'
+      const result = spawnSync(bash, ["-c", prefix + shell], { encoding: "utf8", windowsHide: true, env: { ...process.env, DFCODE_FIXTURE_BIN: temp, CALLS: calls, DRAFT_TAG: tag, DRAFT_EXISTS: exists, GITHUB_REPOSITORY: repository, DFCODE_BUILD_REPOSITORY: "builder/studio" } })
       assert.equal(result.status === 0, pass, `${tag}: ${result.stderr}`)
       assert.equal(fs.existsSync(calls), called, tag)
     }
@@ -110,7 +116,7 @@ test("escapes config as YAML values and rejects GitHub expression injection", ()
   assert.throws(() => renderWorkflow(fixture({ studioCommit: "main" })), /studioCommit/)
 })
 
-test("writes a new dedicated workflow and never replaces an existing file or symlink", () => {
+test("writes a new dedicated workflow and never replaces an existing file", () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "dfcode-render-workflow-"))
   try {
     const output = path.join(temp, ".github/workflows/desktop-installers.yml")
@@ -118,10 +124,17 @@ test("writes a new dedicated workflow and never replaces an existing file or sym
     const original = fs.readFileSync(output, "utf8")
     assert.throws(() => writeWorkflow(fixture({ version: "9.9.9" }), output), /EEXIST/)
     assert.equal(fs.readFileSync(output, "utf8"), original)
-    const link = path.join(temp, "workflow-link.yml")
-    fs.symlinkSync(output, link)
+  } finally { fs.rmSync(temp, { recursive: true, force: true }) }
+})
+
+test("workflow output never replaces a symlink", (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "dfcode-render-symlink-"))
+  try {
+    const output = path.join(temp, "original.yml"), link = path.join(temp, "workflow-link.yml")
+    fs.writeFileSync(output, "user workflow")
+    if (!symlinkOrSkip(t, output, link, "file")) return
     assert.throws(() => writeWorkflow(fixture(), link), /EEXIST/)
-    assert.equal(fs.readFileSync(output, "utf8"), original)
+    assert.equal(fs.readFileSync(output, "utf8"), "user workflow")
   } finally { fs.rmSync(temp, { recursive: true, force: true }) }
 })
 

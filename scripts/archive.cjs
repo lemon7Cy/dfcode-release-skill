@@ -76,6 +76,10 @@ function verifyFullOtaEntries(entries, config, target, signingStatus = "unsigned
     assert.equal(manifest.signing.teamId, config.mac.teamId)
     assert.equal(manifest.signing.notarized, true)
   }
+  if (signingStatus === "signed" && target.platform === "win32") {
+    assert(config.windows?.publisherName, "Signed Windows verification requires the configured publisher")
+    assert.equal(manifest.signing.publisherName, config.windows.publisherName, "Windows manifest publisher mismatch")
+  }
   const expected = target.platform === "darwin"
     ? [`DFCode-${config.version}-arm64.dmg`, `DFCode-${config.version}-arm64.zip`, `DFCode-${config.version}-arm64.zip.blockmap`, `${config.channel}-mac.yml`]
     : [`DFCode-${config.version}-x64.exe`, `DFCode-${config.version}-x64.exe.blockmap`, `${config.channel}.yml`]

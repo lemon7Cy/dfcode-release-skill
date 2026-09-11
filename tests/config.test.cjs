@@ -25,3 +25,23 @@ test("explicit attempt separates CI recovery without changing source or release 
   assert.equal(first.studioCommit, second.studioCommit)
   assert.throws(() => normalizeConfig({ ...sample(), attempt: -1 }))
 })
+
+test("Windows public signing identifiers and optional tool paths have portable defaults", () => {
+  const base = os.tmpdir()
+  const config = normalizeConfig({ ...sample(), windows: { publisherName: "Example Publisher, Ltd", certificateSha1: "a".repeat(40), keypairAlias: "release_key", signtoolPath: "tools/signtool.exe" } }, base)
+  assert.equal(config.windows.certificateSha1, "A".repeat(40))
+  assert.equal(config.windows.timestampUrl, "http://timestamp.digicert.com")
+  assert.equal(config.windows.preserveMicrosoftSignatures, true)
+  assert.equal(config.windows.signtoolPath, path.resolve(base, "tools/signtool.exe"))
+  assert.equal(normalizeConfig(sample()).windows, undefined)
+  assert.equal(normalizeConfig({ ...sample(), windows: {} }).windows.preserveMicrosoftSignatures, true)
+})
+
+test("Windows config rejects credentials, malformed identities and unsafe timestamp URLs", () => {
+  for (const windows of [
+    [], null, { apiKey: "secret" }, { clientCertificate: "secret.p12" }, { password: "secret" },
+    { certificateSha1: "main" }, { publisherName: "bad\nname" }, { keypairAlias: "" },
+    { timestampUrl: "https://user:pass@example.com" }, { timestampUrl: "file:///timestamp" },
+    { timestampUrl: "https://example.com/?token=secret" }, { preserveMicrosoftSignatures: "false" },
+  ]) assert.throws(() => normalizeConfig({ ...sample(), windows }))
+})

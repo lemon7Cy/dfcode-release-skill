@@ -4,9 +4,41 @@ const fs = require("node:fs")
 const path = require("node:path")
 const os = require("node:os")
 const { spawnSync } = require("node:child_process")
-const { parse, chooseVersion, routeHost, nativeSigningArguments, macPublicationInputs, windowsPublicationInputs, assertExistingRelease } = require("../scripts/release.cjs")
+const { parse, chooseVersion, routeHost, nativeSigningArguments, macPublicationInputs, windowsPublicationInputs, assertExistingRelease, installFrozenDependencies } = require("../scripts/release.cjs")
 const { normalizeConfig } = require("../scripts/config.cjs")
 const { hashFile } = require("../scripts/io.cjs")
+
+test("a successful frozen install runs only once in the selected workspace", () => {
+  const calls = []
+  installFrozenDependencies("workspace", (...args) => calls.push(args))
+  assert.deepEqual(calls, [["bun", ["install", "--frozen-lockfile"], { cwd: "workspace" }]])
+})
+
+test("tarball extraction failure retries once with identical frozen inputs", () => {
+  const calls = []
+  installFrozenDependencies("workspace", (...args) => {
+    calls.push(args)
+    if (calls.length === 1) throw new Error('bun failed (1): error: Fail extracting tarball for "fixture"')
+  })
+  assert.equal(calls.length, 2)
+  assert.deepEqual(calls[1], calls[0])
+  assert.deepEqual(calls[0], ["bun", ["install", "--frozen-lockfile"], { cwd: "workspace" }])
+})
+
+test("a second extraction failure stops and preserves the error", () => {
+  let calls = 0
+  const failure = new Error("Fail extracting tarball")
+  assert.throws(() => installFrozenDependencies("workspace", () => { calls++; throw failure }), error => error === failure)
+  assert.equal(calls, 2)
+})
+
+test("other installation failures are never retried", () => {
+  for (const failure of [new Error("lockfile had changes, but lockfile is frozen"), new Error("Unauthorized"), new Error("ENOSPC"), null]) {
+    let calls = 0
+    assert.throws(() => installFrozenDependencies("workspace", () => { calls++; throw failure }), error => error === failure)
+    assert.equal(calls, 1)
+  }
+})
 
 test("version selection uses stable releases, not draft or prerelease labels", () => {
   const releases = [{ tagName: "studio-v0.2.26", isDraft: false, isPrerelease: false }, { tagName: "studio-v0.2.28", isDraft: true }, { tagName: "studio-v0.2.99", isPrerelease: true }]

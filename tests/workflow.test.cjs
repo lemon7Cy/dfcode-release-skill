@@ -109,6 +109,14 @@ test("draft validation rejects empty, formal, invalid and missing tags before bu
   } finally { fs.rmSync(temp, { recursive: true, force: true }) }
 })
 
+test("draft preflight can see unpublished releases with a job-scoped contents token", () => {
+  const text = renderWorkflow(fixture())
+  const prepare = text.slice(text.indexOf("  prepare:"), text.indexOf("\n  build-macos:"))
+  assert.match(prepare, /permissions:\n      contents: write/)
+  assert.match(text, /\npermissions:\n  contents: read/)
+  assert.doesNotMatch(prepare, /gh release (?:create|edit|upload)|secrets\./)
+})
+
 test("escapes config as YAML values and rejects GitHub expression injection", () => {
   const config = fixture({ updateBaseUrl: 'https://downloads.example.com/a/quote"/literal$(text)' })
   assert.equal(renderedEnvironment(renderWorkflow(config)).DFCODE_FULL_OTA_BASE_URL, config.updateBaseUrl)

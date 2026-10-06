@@ -37,6 +37,9 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    # GitHub requires push access to read an unpublished draft Release.
+    permissions:
+      contents: write
     steps:
       - name: Verify build repository and existing draft
         shell: bash

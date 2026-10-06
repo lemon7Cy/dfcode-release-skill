@@ -82,6 +82,17 @@ function assertRepoCommit(repository, commit) {
   assert.equal(result.sha, commit, `Commit mismatch in ${repository}`)
 }
 
+function installFrozenDependencies(workspace, command = run) {
+  const install = () => command("bun", ["install", "--frozen-lockfile"], { cwd: workspace })
+  try {
+    install()
+  } catch (error) {
+    if (!(error instanceof Error) || !/Fail extracting tarball/.test(error.message)) throw error
+    console.error("Retrying one failed tarball extraction with the unchanged frozen lockfile")
+    install()
+  }
+}
+
 function prepare(config) {
   notesCheck(config)
   assert(!fs.existsSync(stateFile(config)), "This release already has CI state; resume existing stages instead of rebuilding")
@@ -98,13 +109,14 @@ function prepare(config) {
   const ownership = path.join(config.outputDir, "state", "ownership.json")
   assert(!fs.existsSync(ownership), "Preparation started previously; inspect partial checkout before retrying in a new directory")
   writeJson(ownership, { configHash: fingerprint(config), workspace: config.workspace, createdAt: new Date().toISOString() })
-  run("git", ["clone", "--filter=blob:none", "--no-checkout", `https://github.com/${config.studioRepository}.git`, config.workspace])
+  // The local CI clone must retain all objects when its remote changes to staging.
+  run("git", ["clone", "--no-checkout", `https://github.com/${config.studioRepository}.git`, config.workspace])
   run("git", ["fetch", "--no-tags", "origin", config.studioCommit], { cwd: config.workspace })
   run("git", ["checkout", "--detach", config.studioCommit], { cwd: config.workspace })
   const required = ["scripts/set-desktop-version.mjs", "scripts/engine-contract.mjs", "scripts/build-engine-binary.sh", "scripts/pack-desktop.sh", "scripts/pack-desktop-win.mjs", "scripts/prepare-admin-full-ota-release.mjs", "packages/desktop/package.json", "bun.lock"]
   for (const name of required) assert(fs.existsSync(path.join(config.workspace, name)), `Selected Studio source lacks expected build contract: ${name}`)
   assert.equal(run("bun", ["--version"]), "1.3.14", "Use Bun 1.3.14 to match the CI toolchain before installing dependencies")
-  run("bun", ["install", "--frozen-lockfile"], { cwd: config.workspace })
+  installFrozenDependencies(config.workspace)
   const ciWorkspace = path.join(config.outputDir, ".work.noindex", "ci-checkout")
   assert(!fs.existsSync(ciWorkspace), "CI staging path is not empty")
   run("git", ["clone", "--no-hardlinks", config.workspace, ciWorkspace])
@@ -459,5 +471,5 @@ async function main(argv = process.argv.slice(2)) {
   if (options.command === "publish") return publish(config, options)
 }
 
-module.exports = { parse, chooseVersion, routeHost, nativeSigningArguments, macPublicationInputs, windowsPublicationInputs, assertExistingRelease, main }
+module.exports = { parse, chooseVersion, routeHost, nativeSigningArguments, macPublicationInputs, windowsPublicationInputs, assertExistingRelease, installFrozenDependencies, main }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })

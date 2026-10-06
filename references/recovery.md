@@ -2,6 +2,9 @@
 
 ## CI
 
+- Preparation uses a full local clone so the separate CI checkout remains pushable after its remote changes to the staging repository. Do not restore blob-filtered cloning without preserving access to every promised object.
+- A local Bun tarball extraction failure is retried once with the same frozen lockfile. Other errors, or a failed retry, stop preparation; preserve the partial checkout for diagnosis. This does not retry a paid CI build or signing request.
+- The draft preflight job needs its own `contents: write` permission to see unpublished Release assets; the workflow default remains read-only. Its script only validates the existing draft and must not publish or upload anything.
 - `outputDir/state/ci.json` binds configuration fingerprint, workflow commit, branch, draft tag and run ID. `status` and `wait` never dispatch. A failed workflow must be diagnosed before any paid rerun; do not silently choose another source commit.
 - Set Windows public signing config before `prepare` when using the same machine through publication. Keep both notes files frozen through prepare/dispatch/collect. Changing paths or adding Windows fields later does not preserve the original fingerprint. For cross-machine local signing, transfer verified unsigned inputs and `reports/verify-ci.json` to a fresh output with a local config; do not rewrite or reuse Mac CI state as Windows publication state.
 - `dispatchPending: true` means an API call may have reached GitHub before the local record captured its run ID. Inspect `gh run list --repo BUILD_REPO --branch BRANCH --json databaseId,headSha,event,createdAt`; match the exact workflow commit and dispatch time, then record that one ID in the local state. Do not call dispatch again while uncertain.
